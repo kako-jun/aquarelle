@@ -1,0 +1,25 @@
+[package]
+name = "aquarelle"
+version = "0.1.0"
+edition = "2021"
+authors = ["kako-jun"]
+description = "Watercolor-style soft-bleed orb rendering: four tunable elements (bleed, bloom, offset, halo) composed onto a tiny-skia Pixmap. Renderer-agnostic and wasm-friendly."
+license = "MIT"
+homepage = "https://github.com/kako-jun/aquarelle"
+repository = "https://github.com/kako-jun/aquarelle"
+documentation = "https://docs.rs/aquarelle"
+readme = "README.md"
+keywords = ["watercolor", "bleed", "orb", "render", "tiny-skia"]
+categories = ["graphics", "rendering"]
+exclude = [".github/", "target/"]
+rust-version = "1.78.0"
+
+[dependencies]
+palette = "0.7"
+rand = "0.8"
+rand_chacha = "0.3"
+tiny-skia = "0.11"
+
+[profile.release]
+lto = true
+codegen-units = 1
