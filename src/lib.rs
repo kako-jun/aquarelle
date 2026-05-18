@@ -55,6 +55,16 @@
 //! Identical `(center, radius, color, seed, params)` produce
 //! byte-identical pixels. RNG state is seeded per call via
 //! `ChaCha8Rng::seed_from_u64(seed)` and never touches `thread_rng`.
+//!
+//! # Bleed pass (v0.2)
+//!
+//! For callers that already have a rasterized image (e.g. ink lines on a
+//! white background from `blueprinter`) and want to bleed the existing
+//! pixels themselves, [`render_aquarelle_bleed_pass`] applies a
+//! Gaussian-approximating box blur (3 passes) to the whole pixmap with a
+//! halo saturation boost and a faint seed-derived paper-grain noise. The
+//! original picture is then re-composited on top, so the bleed reads as
+//! a halo underneath the existing strokes.
 
 use palette::{FromColor, Hsl, IntoColor, Srgb};
 use rand::{Rng, SeedableRng};
@@ -270,6 +280,291 @@ fn boost_saturation(rgb: [u8; 3], factor: f32) -> [u8; 3] {
     ]
 }
 
+/// Knobs for [`render_aquarelle_bleed_pass`]. All values are interpreted
+/// in their natural range and clamped internally; callers can pass raw
+/// slider values without pre-validation.
+#[derive(Debug, Clone, Copy)]
+pub struct AquarelleBleedParams {
+    /// Radius of the Gaussian-approximating spread in pixels. The
+    /// implementation uses a 3-pass box blur whose box width is derived
+    /// from this radius (≈ `radius * 1.15`). `0.0` disables the pass.
+    pub radius: f32,
+    /// Intensity of the bleed in `0.0..=1.0`. `0.0` leaves the pixmap
+    /// untouched; `1.0` lets the blurred layer show through at full
+    /// alpha underneath the original. Out-of-range values are clamped.
+    pub intensity: f32,
+    /// Halo saturation boost applied to the blurred bleed layer in
+    /// `0.0..=1.0`. `0.0` keeps the layer at source saturation; `1.0`
+    /// multiplies saturation by `1.6` (film halation feel, matching the
+    /// orb halo knob).
+    pub halo: f32,
+}
+
+impl Default for AquarelleBleedParams {
+    /// Mild paper-bleed preset: `radius = 3.0`, `intensity = 0.5`,
+    /// `halo = 0.3`. Suitable as a starting point for ink-on-paper
+    /// looks where the original picture is the foreground.
+    fn default() -> Self {
+        Self {
+            radius: 3.0,
+            intensity: 0.5,
+            halo: 0.3,
+        }
+    }
+}
+
+impl AquarelleBleedParams {
+    /// Return a copy with every field clamped to its valid range
+    /// (`radius >= 0.0`, `intensity` and `halo` in `0.0..=1.0`). Called
+    /// internally by [`render_aquarelle_bleed_pass`] — exposed publicly
+    /// so callers that want to mirror the clamp can stay in sync.
+    pub fn clamped(self) -> Self {
+        Self {
+            radius: self.radius.max(0.0),
+            intensity: self.intensity.clamp(0.0, 1.0),
+            halo: self.halo.clamp(0.0, 1.0),
+        }
+    }
+}
+
+/// Apply a watercolor bleed pass to an entire `pixmap`.
+///
+/// Unlike [`render_aquarelle_orb`], which draws a new orb from
+/// `(center, radius, color)`, this pass bleeds the pixels already
+/// rasterized in `pixmap`. Internally it:
+///
+/// 1. Snapshots the current pixmap.
+/// 2. Applies a 3-pass box blur to the snapshot (Gaussian approximation
+///    via the central limit theorem). The blur runs on pre-multiplied
+///    RGBA so alpha bleeds naturally.
+/// 3. Boosts saturation on the blurred layer by `params.halo`.
+/// 4. Multiplies the blurred layer by a faint seed-derived paper-grain
+///    noise (`±10 % * intensity`) so repeated frames stay watercolor-y
+///    instead of flat-blurry.
+/// 5. Linearly blends the blurred layer into the original by
+///    `intensity` (`out = original * (1 - intensity) + blurred * intensity`).
+///    The blend is performed in sRGB byte space without gamma correction;
+///    this matches typical watercolor compositing in practice and keeps
+///    the per-pixel cost minimal.
+///    For the `blueprinter` use case of "black ink on white paper" the
+///    dark ink bleeds outward, mixing into the surrounding white to
+///    produce a soft gray halo while distant white pixels stay white.
+///
+/// Identical `(pixmap, params, seed)` produce byte-identical output.
+///
+/// # Example
+///
+/// ```
+/// use aquarelle::{render_aquarelle_bleed_pass, AquarelleBleedParams};
+/// use tiny_skia::{Color, Paint, PathBuilder, Pixmap, Transform, FillRule};
+///
+/// // Start from a white page with a single black dot.
+/// let mut pix = Pixmap::new(64, 64).unwrap();
+/// pix.fill(Color::from_rgba8(255, 255, 255, 255));
+/// let mut paint = Paint::default();
+/// paint.set_color_rgba8(0, 0, 0, 255);
+/// let mut pb = PathBuilder::new();
+/// pb.push_circle(32.0, 32.0, 4.0);
+/// let path = pb.finish().unwrap();
+/// pix.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+///
+/// render_aquarelle_bleed_pass(
+///     &mut pix,
+///     AquarelleBleedParams::default(),
+///     42,
+/// );
+/// ```
+pub fn render_aquarelle_bleed_pass(pixmap: &mut Pixmap, params: AquarelleBleedParams, seed: u64) {
+    let p = params.clamped();
+    if p.radius <= 0.0 || p.intensity <= 0.0 {
+        return;
+    }
+
+    let width = pixmap.width() as usize;
+    let height = pixmap.height() as usize;
+    if width == 0 || height == 0 {
+        return;
+    }
+
+    // Snapshot the current pixmap. `original` is the foreground that
+    // will be re-composited on top after blurring.
+    let original: Vec<u8> = pixmap.data().to_vec();
+
+    // Work buffer for the blur. Operates on pre-multiplied RGBA bytes.
+    let mut blurred = original.clone();
+    let box_width = (p.radius * 1.15).round().max(1.0) as usize;
+    let box_radius = box_width.max(1);
+    let mut scratch = vec![0u8; blurred.len()];
+    for _ in 0..3 {
+        box_blur_horizontal(&blurred, &mut scratch, width, height, box_radius);
+        box_blur_vertical(&scratch, &mut blurred, width, height, box_radius);
+    }
+
+    // Halo: saturation boost on the blurred layer.
+    if p.halo > 0.0 {
+        boost_saturation_buffer(&mut blurred, 1.0 + 0.6 * p.halo);
+    }
+
+    // Paper-grain noise: faint seed-derived multiplicative jitter so the
+    // bleed reads as paper texture and not as a flat Gaussian. Amplitude
+    // is capped at 0.1 × intensity to stay subtle on edge cases (e.g.
+    // fully transparent inputs at intensity = 1.0).
+    let mut rng = ChaCha8Rng::seed_from_u64(seed);
+    let noise_amp = 0.1 * p.intensity;
+    if noise_amp > 0.0 {
+        for px in blurred.chunks_exact_mut(4) {
+            let n = 1.0 + (rng.gen_range(-1.0..=1.0_f32)) * noise_amp;
+            // Noise is a paper-texture concept: only modulate RGB and
+            // leave alpha untouched so opaque pixels stay opaque. Then
+            // clamp each channel by alpha to preserve the premultiplied
+            // invariant `RGB <= A`.
+            for c in &mut px[..3] {
+                *c = ((*c as f32) * n).clamp(0.0, 255.0).round() as u8;
+            }
+            let a = px[3];
+            px[0] = px[0].min(a);
+            px[1] = px[1].min(a);
+            px[2] = px[2].min(a);
+        }
+    }
+
+    // Compose: linearly blend the blurred layer into the original by
+    // `intensity`. With intensity=0 the pixmap is unchanged; with
+    // intensity=1 the pixmap is replaced by the blurred layer. For the
+    // ink-on-paper use case (black dot on white page) this produces a
+    // soft gray halo around the dot — the blur spreads the dark ink
+    // outward, and the intensity-weighted mix darkens nearby white
+    // pixels without touching distant ones.
+    let t = p.intensity;
+    let inv = 1.0 - t;
+    let dst = pixmap.data_mut();
+    for (d, (o, b)) in dst
+        .chunks_exact_mut(4)
+        .zip(original.chunks_exact(4).zip(blurred.chunks_exact(4)))
+    {
+        for i in 0..4 {
+            let v = (o[i] as f32) * inv + (b[i] as f32) * t;
+            d[i] = v.clamp(0.0, 255.0).round() as u8;
+        }
+    }
+}
+
+/// 1D box blur along the horizontal axis. `src` and `dst` are
+/// pre-multiplied RGBA buffers of `width * height * 4` bytes. The blur
+/// uses clamp-to-edge sampling so edge pixels are not darkened.
+fn box_blur_horizontal(src: &[u8], dst: &mut [u8], width: usize, height: usize, radius: usize) {
+    // Clamp the effective radius so the initialisation window never
+    // indexes past the rightmost pixel. With this cap a `radius` larger
+    // than `width - 1` simply converges towards the row's mean, which is
+    // the natural clamp-to-edge limit. Caller guarantees width >= 1.
+    let radius = radius.min(width - 1);
+    let window = (radius * 2 + 1) as f32;
+    for y in 0..height {
+        let row = y * width * 4;
+        // Initialise running sum over the first window centred at x=0.
+        let mut sum = [0f32; 4];
+        for k in 0..=radius {
+            let i = row + k * 4;
+            for c in 0..4 {
+                sum[c] += src[i + c] as f32;
+            }
+        }
+        // The remaining radius samples to the left of x=0 are clamped
+        // to the leftmost pixel.
+        for c in 0..4 {
+            sum[c] += src[row + c] as f32 * radius as f32;
+        }
+        for x in 0..width {
+            let oi = row + x * 4;
+            for c in 0..4 {
+                dst[oi + c] = (sum[c] / window).clamp(0.0, 255.0).round() as u8;
+            }
+            // Slide window: subtract leftmost, add new rightmost.
+            let left_idx = x.saturating_sub(radius);
+            let right_idx = if x + radius + 1 < width {
+                x + radius + 1
+            } else {
+                width - 1
+            };
+            let lp = row + left_idx * 4;
+            let rp = row + right_idx * 4;
+            for c in 0..4 {
+                sum[c] += src[rp + c] as f32 - src[lp + c] as f32;
+            }
+        }
+    }
+}
+
+/// 1D box blur along the vertical axis. Mirror of
+/// [`box_blur_horizontal`] but stepping by `width * 4` bytes per row.
+fn box_blur_vertical(src: &[u8], dst: &mut [u8], width: usize, height: usize, radius: usize) {
+    // Mirror of the horizontal clamp: cap radius at `height - 1` so the
+    // first-window initialisation cannot step past the bottom row.
+    // Caller guarantees height >= 1.
+    let radius = radius.min(height - 1);
+    let window = (radius * 2 + 1) as f32;
+    let stride = width * 4;
+    for x in 0..width {
+        let col = x * 4;
+        let mut sum = [0f32; 4];
+        for k in 0..=radius {
+            let i = col + k * stride;
+            for c in 0..4 {
+                sum[c] += src[i + c] as f32;
+            }
+        }
+        for c in 0..4 {
+            sum[c] += src[col + c] as f32 * radius as f32;
+        }
+        for y in 0..height {
+            let oi = col + y * stride;
+            for c in 0..4 {
+                dst[oi + c] = (sum[c] / window).clamp(0.0, 255.0).round() as u8;
+            }
+            let top_idx = y.saturating_sub(radius);
+            let bot_idx = if y + radius + 1 < height {
+                y + radius + 1
+            } else {
+                height - 1
+            };
+            let tp = col + top_idx * stride;
+            let bp = col + bot_idx * stride;
+            for c in 0..4 {
+                sum[c] += src[bp + c] as f32 - src[tp + c] as f32;
+            }
+        }
+    }
+}
+
+/// Apply [`boost_saturation`] over an entire pre-multiplied RGBA buffer.
+/// Pixels with zero alpha are skipped (no defined hue). For non-zero
+/// alpha the saturation operation is performed on the un-premultiplied
+/// color, then re-premultiplied.
+fn boost_saturation_buffer(buf: &mut [u8], factor: f32) {
+    if (factor - 1.0).abs() < f32::EPSILON {
+        return;
+    }
+    for px in buf.chunks_exact_mut(4) {
+        let a = px[3];
+        if a == 0 {
+            continue;
+        }
+        let af = a as f32 / 255.0;
+        // Un-premultiply.
+        let r = (px[0] as f32 / 255.0) / af;
+        let g = (px[1] as f32 / 255.0) / af;
+        let b = (px[2] as f32 / 255.0) / af;
+        let srgb = Srgb::new(r.clamp(0.0, 1.0), g.clamp(0.0, 1.0), b.clamp(0.0, 1.0));
+        let mut hsl: Hsl = Hsl::from_color(srgb);
+        hsl.saturation = (hsl.saturation * factor).clamp(0.0, 1.0);
+        let out: Srgb = hsl.into_color();
+        // Re-premultiply.
+        px[0] = (out.red.clamp(0.0, 1.0) * af * 255.0).round() as u8;
+        px[1] = (out.green.clamp(0.0, 1.0) * af * 255.0).round() as u8;
+        px[2] = (out.blue.clamp(0.0, 1.0) * af * 255.0).round() as u8;
+    }
+}
+
 fn mix_with_white(rgb: [u8; 3], amount: f32) -> [u8; 3] {
     let a = amount.clamp(0.0, 1.0);
     [
@@ -404,6 +699,100 @@ mod tests {
         );
     }
 
+    fn fresh_white(w: u32, h: u32) -> Pixmap {
+        let mut p = Pixmap::new(w, h).expect("pixmap");
+        p.fill(Color::from_rgba8(255, 255, 255, 255));
+        p
+    }
+
+    fn draw_black_dot(pix: &mut Pixmap, cx: f32, cy: f32, r: f32) {
+        let mut paint = tiny_skia::Paint::default();
+        paint.set_color_rgba8(0, 0, 0, 255);
+        let mut pb = PathBuilder::new();
+        pb.push_circle(cx, cy, r);
+        let path = pb.finish().expect("path");
+        pix.fill_path(
+            &path,
+            &paint,
+            FillRule::Winding,
+            Transform::identity(),
+            None,
+        );
+    }
+
+    #[test]
+    fn bleed_pass_zero_radius_is_noop() {
+        let mut pix = fresh_white(32, 32);
+        draw_black_dot(&mut pix, 16.0, 16.0, 4.0);
+        let snapshot = pix.data().to_vec();
+        render_aquarelle_bleed_pass(
+            &mut pix,
+            AquarelleBleedParams {
+                radius: 0.0,
+                ..AquarelleBleedParams::default()
+            },
+            42,
+        );
+        assert_eq!(pix.data(), &snapshot[..]);
+    }
+
+    #[test]
+    fn bleed_pass_zero_intensity_is_noop() {
+        let mut pix = fresh_white(32, 32);
+        draw_black_dot(&mut pix, 16.0, 16.0, 4.0);
+        let snapshot = pix.data().to_vec();
+        render_aquarelle_bleed_pass(
+            &mut pix,
+            AquarelleBleedParams {
+                intensity: 0.0,
+                ..AquarelleBleedParams::default()
+            },
+            42,
+        );
+        assert_eq!(pix.data(), &snapshot[..]);
+    }
+
+    #[test]
+    fn bleed_pass_changes_surrounding_pixels() {
+        // White page + small black dot in the middle. After the bleed
+        // pass, pixels just outside the dot should darken (gray halo).
+        let mut pix = fresh_white(64, 64);
+        draw_black_dot(&mut pix, 32.0, 32.0, 3.0);
+        let before = pix.pixel(32, 38).expect("pixel");
+        render_aquarelle_bleed_pass(&mut pix, AquarelleBleedParams::default(), 42);
+        let after = pix.pixel(32, 38).expect("pixel");
+        assert!(
+            after.red() < before.red(),
+            "halo should darken nearby pixel: before={} after={}",
+            before.red(),
+            after.red()
+        );
+    }
+
+    #[test]
+    fn bleed_pass_is_deterministic() {
+        let mut a = fresh_white(48, 48);
+        let mut b = fresh_white(48, 48);
+        draw_black_dot(&mut a, 24.0, 24.0, 3.0);
+        draw_black_dot(&mut b, 24.0, 24.0, 3.0);
+        render_aquarelle_bleed_pass(&mut a, AquarelleBleedParams::default(), 12345);
+        render_aquarelle_bleed_pass(&mut b, AquarelleBleedParams::default(), 12345);
+        assert_eq!(a.data(), b.data());
+    }
+
+    #[test]
+    fn bleed_params_clamped_caps_out_of_range() {
+        let p = AquarelleBleedParams {
+            radius: -1.0,
+            intensity: 2.0,
+            halo: -0.5,
+        }
+        .clamped();
+        assert_eq!(p.radius, 0.0);
+        assert_eq!(p.intensity, 1.0);
+        assert_eq!(p.halo, 0.0);
+    }
+
     #[test]
     fn clamped_caps_out_of_range() {
         let p = AquarelleParams {
@@ -417,5 +806,293 @@ mod tests {
         assert_eq!(p.bloom, 0.0);
         assert_eq!(p.offset, 1.0);
         assert_eq!(p.halo, 0.0);
+    }
+
+    #[test]
+    fn bleed_pass_default_values_match_spec() {
+        let d = AquarelleBleedParams::default();
+        assert_eq!(d.radius, 3.0);
+        assert_eq!(d.intensity, 0.5);
+        assert_eq!(d.halo, 0.3);
+    }
+
+    #[test]
+    fn bleed_pass_uniform_input_is_invariant() {
+        // A uniform-color pixmap should remain (approximately) the same
+        // color after the bleed pass: the box blur is a no-op on uniform
+        // input (clamp-to-edge), halo=0 disables saturation boost, and
+        // only the seed-derived multiplicative noise (±10% × intensity)
+        // can perturb individual pixels.
+        let mut pix = Pixmap::new(32, 32).expect("pixmap");
+        pix.fill(Color::from_rgba8(128, 64, 32, 255));
+        let before = pix.data().to_vec();
+        render_aquarelle_bleed_pass(
+            &mut pix,
+            AquarelleBleedParams {
+                radius: 3.0,
+                intensity: 1.0,
+                halo: 0.0,
+            },
+            0,
+        );
+        let after = pix.data();
+        // Tolerance: noise amplitude is 0.1 × intensity = 0.1, applied
+        // multiplicatively. For the largest channel (red=128) the max
+        // perturbation is ~12.8, with some additional slack for blur
+        // rounding at the edges. 26 is well above the worst case.
+        for (b, a) in before.chunks_exact(4).zip(after.chunks_exact(4)) {
+            for i in 0..4 {
+                let diff = (b[i] as i32 - a[i] as i32).abs();
+                assert!(
+                    diff <= 26,
+                    "uniform input should stay close: channel {i} before={} after={} diff={}",
+                    b[i],
+                    a[i],
+                    diff
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bleed_pass_intensity_monotonic() {
+        // White background + central black dot. As intensity increases,
+        // the blurred dark layer mixes more strongly into nearby pixels,
+        // so red at a point a few pixels off-center must decrease
+        // monotonically (0.0 ≥ 0.5 ≥ 1.0).
+        fn render_at_intensity(intensity: f32) -> u8 {
+            let mut pix = fresh_white(64, 64);
+            // 1-pixel "dot": tiny circle so the bleed has plenty of
+            // contrast to spread.
+            draw_black_dot(&mut pix, 32.0, 32.0, 0.5);
+            render_aquarelle_bleed_pass(
+                &mut pix,
+                AquarelleBleedParams {
+                    radius: 3.0,
+                    intensity,
+                    halo: 0.5,
+                },
+                42,
+            );
+            pix.pixel(34, 32).expect("pixel").red()
+        }
+        let r0 = render_at_intensity(0.0);
+        let r05 = render_at_intensity(0.5);
+        let r1 = render_at_intensity(1.0);
+        assert!(
+            r0 >= r05 && r05 >= r1,
+            "red should decrease monotonically: r0={r0} r05={r05} r1={r1}"
+        );
+    }
+
+    #[test]
+    fn bleed_pass_halo_changes_output() {
+        let mut a = fresh_white(64, 64);
+        draw_black_dot(&mut a, 32.0, 32.0, 3.0);
+        // Replace the dot with a saturated red so the halo saturation
+        // boost has color to work with.
+        let mut paint = tiny_skia::Paint::default();
+        paint.set_color_rgba8(200, 50, 50, 255);
+        let mut pb = PathBuilder::new();
+        pb.push_circle(32.0, 32.0, 3.0);
+        let path = pb.finish().expect("path");
+        a.fill_path(
+            &path,
+            &paint,
+            FillRule::Winding,
+            Transform::identity(),
+            None,
+        );
+        let mut b = a.clone();
+        render_aquarelle_bleed_pass(
+            &mut a,
+            AquarelleBleedParams {
+                radius: 3.0,
+                intensity: 0.5,
+                halo: 0.0,
+            },
+            42,
+        );
+        render_aquarelle_bleed_pass(
+            &mut b,
+            AquarelleBleedParams {
+                radius: 3.0,
+                intensity: 0.5,
+                halo: 1.0,
+            },
+            42,
+        );
+        assert_ne!(
+            a.data(),
+            b.data(),
+            "halo=0 and halo=1 should produce different output"
+        );
+    }
+
+    #[test]
+    fn bleed_pass_different_seeds_differ() {
+        let mut a = fresh_white(64, 64);
+        let mut b = fresh_white(64, 64);
+        draw_black_dot(&mut a, 32.0, 32.0, 3.0);
+        draw_black_dot(&mut b, 32.0, 32.0, 3.0);
+        render_aquarelle_bleed_pass(&mut a, AquarelleBleedParams::default(), 1);
+        render_aquarelle_bleed_pass(&mut b, AquarelleBleedParams::default(), 2);
+        assert_ne!(a.data(), b.data(), "different seeds should perturb noise");
+    }
+
+    #[test]
+    fn bleed_pass_seed_irrelevant_when_intensity_zero() {
+        let mut a = fresh_white(48, 48);
+        let mut b = fresh_white(48, 48);
+        draw_black_dot(&mut a, 24.0, 24.0, 3.0);
+        draw_black_dot(&mut b, 24.0, 24.0, 3.0);
+        let params = AquarelleBleedParams {
+            intensity: 0.0,
+            ..AquarelleBleedParams::default()
+        };
+        render_aquarelle_bleed_pass(&mut a, params, 1);
+        render_aquarelle_bleed_pass(&mut b, params, 99999);
+        assert_eq!(
+            a.data(),
+            b.data(),
+            "intensity=0 must short-circuit before seed is consumed"
+        );
+    }
+
+    #[test]
+    fn bleed_pass_tall_pixmap_does_not_panic() {
+        let mut pix = Pixmap::new(1, 100).expect("pixmap");
+        pix.fill(Color::from_rgba8(255, 255, 255, 255));
+        render_aquarelle_bleed_pass(&mut pix, AquarelleBleedParams::default(), 42);
+    }
+
+    #[test]
+    fn bleed_pass_wide_pixmap_does_not_panic() {
+        let mut pix = Pixmap::new(100, 1).expect("pixmap");
+        pix.fill(Color::from_rgba8(255, 255, 255, 255));
+        render_aquarelle_bleed_pass(&mut pix, AquarelleBleedParams::default(), 42);
+    }
+
+    #[test]
+    fn bleed_pass_1x1_pixmap_does_not_panic() {
+        let mut pix = Pixmap::new(1, 1).expect("pixmap");
+        pix.fill(Color::from_rgba8(255, 255, 255, 255));
+        render_aquarelle_bleed_pass(&mut pix, AquarelleBleedParams::default(), 42);
+    }
+
+    #[test]
+    fn bleed_pass_huge_radius_does_not_panic() {
+        // Radius far larger than the pixmap. After a 3-pass box blur of
+        // an enormous window the entire image should converge to roughly
+        // the mean color, so the max pairwise channel difference must
+        // remain small.
+        let mut pix = fresh_white(16, 16);
+        draw_black_dot(&mut pix, 8.0, 8.0, 2.0);
+        render_aquarelle_bleed_pass(
+            &mut pix,
+            AquarelleBleedParams {
+                radius: 1000.0,
+                intensity: 1.0,
+                halo: 0.0,
+            },
+            42,
+        );
+        let data = pix.data();
+        let mut max_r = 0u8;
+        let mut min_r = 255u8;
+        for px in data.chunks_exact(4) {
+            max_r = max_r.max(px[0]);
+            min_r = min_r.min(px[0]);
+        }
+        let spread = max_r as i32 - min_r as i32;
+        assert!(
+            spread <= 30,
+            "huge radius should converge to near-uniform color, but red spread={spread}"
+        );
+    }
+
+    #[test]
+    fn bleed_pass_fully_transparent_pixmap_does_not_panic() {
+        // `Pixmap::new` returns an all-zero buffer (alpha=0). The
+        // `boost_saturation_buffer` loop must `continue` on alpha==0 and
+        // the compose step must keep alpha at zero.
+        let mut pix = Pixmap::new(32, 32).expect("pixmap");
+        render_aquarelle_bleed_pass(
+            &mut pix,
+            AquarelleBleedParams {
+                radius: 3.0,
+                intensity: 0.5,
+                halo: 1.0,
+            },
+            42,
+        );
+        for px in pix.data().chunks_exact(4) {
+            assert_eq!(px[3], 0, "alpha must remain 0 on transparent input");
+        }
+    }
+
+    #[test]
+    fn bleed_pass_repeated_application_is_stable() {
+        // Apply the pass twice. The far corners should still be near
+        // white — bleed shouldn't propagate dramatically across the
+        // entire image after two applications with default radius.
+        let mut pix = fresh_white(64, 64);
+        draw_black_dot(&mut pix, 32.0, 32.0, 3.0);
+        render_aquarelle_bleed_pass(&mut pix, AquarelleBleedParams::default(), 42);
+        render_aquarelle_bleed_pass(&mut pix, AquarelleBleedParams::default(), 42);
+        let corner = pix.pixel(0, 0).expect("pixel");
+        assert!(
+            corner.red() > 200 && corner.green() > 200 && corner.blue() > 200,
+            "far corner should stay near white after 2x bleed: r={} g={} b={}",
+            corner.red(),
+            corner.green(),
+            corner.blue()
+        );
+    }
+
+    #[test]
+    fn bleed_pass_negative_radius_is_noop() {
+        let mut pix = fresh_white(32, 32);
+        draw_black_dot(&mut pix, 16.0, 16.0, 4.0);
+        let snapshot = pix.data().to_vec();
+        render_aquarelle_bleed_pass(
+            &mut pix,
+            AquarelleBleedParams {
+                radius: -5.0,
+                intensity: 0.5,
+                halo: 0.3,
+            },
+            42,
+        );
+        assert_eq!(
+            pix.data(),
+            &snapshot[..],
+            "negative radius should clamp to 0 and short-circuit"
+        );
+    }
+
+    #[test]
+    fn bleed_pass_intensity_one_replaces_with_blurred() {
+        // intensity=1.0 fully replaces the pixmap with the blurred
+        // layer. The center pixel of a black dot should no longer be
+        // pure black because the surrounding white pixels mix in via
+        // the blur.
+        let mut pix = fresh_white(64, 64);
+        draw_black_dot(&mut pix, 32.0, 32.0, 3.0);
+        render_aquarelle_bleed_pass(
+            &mut pix,
+            AquarelleBleedParams {
+                radius: 3.0,
+                intensity: 1.0,
+                halo: 0.0,
+            },
+            42,
+        );
+        let center = pix.pixel(32, 32).expect("pixel");
+        assert!(
+            center.red() > 0,
+            "center red should be lifted off zero by blurred white neighbors, got {}",
+            center.red()
+        );
     }
 }

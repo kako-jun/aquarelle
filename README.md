@@ -21,10 +21,10 @@ renderers (e.g. `blueprinter`) can share the same engine.
 
 ```toml
 [dependencies]
-aquarelle = "0.1"
+aquarelle = "0.2"
 ```
 
-## Example
+## Example: orb rendering
 
 ```rust
 use aquarelle::{render_aquarelle_orb, AquarelleParams};
@@ -45,6 +45,38 @@ render_aquarelle_orb(
 // `pix.data()` is now BGRA bytes you can write to PNG, send to
 // WebCodecs, copy to a GPU texture, etc.
 ```
+
+## Example: bleed pass over an existing picture (v0.2)
+
+Use `render_aquarelle_bleed_pass` when the pixmap already contains your
+art (e.g. ink strokes from `blueprinter`) and you want a soft halo
+underneath the existing pixels.
+
+```rust
+use aquarelle::{render_aquarelle_bleed_pass, AquarelleBleedParams};
+use tiny_skia::{Color, FillRule, Paint, PathBuilder, Pixmap, Transform};
+
+let mut pix = Pixmap::new(128, 128).unwrap();
+pix.fill(Color::from_rgba8(255, 255, 255, 255));
+
+// Draw a black dot to bleed.
+let mut paint = Paint::default();
+paint.set_color_rgba8(0, 0, 0, 255);
+let mut pb = PathBuilder::new();
+pb.push_circle(64.0, 64.0, 8.0);
+let path = pb.finish().unwrap();
+pix.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+
+render_aquarelle_bleed_pass(
+    &mut pix,
+    AquarelleBleedParams::default(), // radius 3, intensity 0.5, halo 0.3
+    42,
+);
+```
+
+A 3-pass box blur approximates a Gaussian; a faint seed-derived paper
+grain is multiplied onto the blurred layer; the original picture is
+then re-composited on top.
 
 ## The four elements
 
@@ -85,6 +117,11 @@ on Cloudflare Pages.
 
 ## Status
 
+- **v0.2.0** — adds `render_aquarelle_bleed_pass` for bleeding an
+  existing rasterized picture (3-pass box blur Gaussian approximation +
+  halo saturation boost + seed-derived paper grain). The original
+  `render_aquarelle_orb` API is unchanged. See
+  [Issue #2](https://github.com/kako-jun/aquarelle/issues/2).
 - **v0.1.0** — extracted from `orber-core v0.3.x`'s in-tree `aquarelle`
   module, where it has been in production since 2026-04 (see
   [`orber` PR #30 / Issue #8](https://github.com/kako-jun/orber/issues/8)).
