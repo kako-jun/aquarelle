@@ -442,6 +442,11 @@ pub fn render_aquarelle_bleed_pass(pixmap: &mut Pixmap, params: AquarelleBleedPa
 /// pre-multiplied RGBA buffers of `width * height * 4` bytes. The blur
 /// uses clamp-to-edge sampling so edge pixels are not darkened.
 fn box_blur_horizontal(src: &[u8], dst: &mut [u8], width: usize, height: usize, radius: usize) {
+    // Clamp the effective radius so the initialisation window never
+    // indexes past the rightmost pixel. With this cap a `radius` larger
+    // than `width - 1` simply converges towards the row's mean, which is
+    // the natural clamp-to-edge limit. Caller guarantees width >= 1.
+    let radius = radius.min(width - 1);
     let window = (radius * 2 + 1) as f32;
     for y in 0..height {
         let row = y * width * 4;
@@ -482,6 +487,10 @@ fn box_blur_horizontal(src: &[u8], dst: &mut [u8], width: usize, height: usize, 
 /// 1D box blur along the vertical axis. Mirror of
 /// [`box_blur_horizontal`] but stepping by `width * 4` bytes per row.
 fn box_blur_vertical(src: &[u8], dst: &mut [u8], width: usize, height: usize, radius: usize) {
+    // Mirror of the horizontal clamp: cap radius at `height - 1` so the
+    // first-window initialisation cannot step past the bottom row.
+    // Caller guarantees height >= 1.
+    let radius = radius.min(height - 1);
     let window = (radius * 2 + 1) as f32;
     let stride = width * 4;
     for x in 0..width {
