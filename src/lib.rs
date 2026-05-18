@@ -343,6 +343,9 @@ impl AquarelleBleedParams {
 ///    instead of flat-blurry.
 /// 5. Linearly blends the blurred layer into the original by
 ///    `intensity` (`out = original * (1 - intensity) + blurred * intensity`).
+///    The blend is performed in sRGB byte space without gamma correction;
+///    this matches typical watercolor compositing in practice and keeps
+///    the per-pixel cost minimal.
 ///    For the `blueprinter` use case of "black ink on white paper" the
 ///    dark ink bleeds outward, mixing into the surrounding white to
 ///    produce a soft gray halo while distant white pixels stay white.
@@ -411,9 +414,17 @@ pub fn render_aquarelle_bleed_pass(pixmap: &mut Pixmap, params: AquarelleBleedPa
     if noise_amp > 0.0 {
         for px in blurred.chunks_exact_mut(4) {
             let n = 1.0 + (rng.gen_range(-1.0..=1.0_f32)) * noise_amp;
-            for c in &mut px[..4] {
-                *c = ((*c as f32) * n).clamp(0.0, 255.0) as u8;
+            // Noise is a paper-texture concept: only modulate RGB and
+            // leave alpha untouched so opaque pixels stay opaque. Then
+            // clamp each channel by alpha to preserve the premultiplied
+            // invariant `RGB <= A`.
+            for c in &mut px[..3] {
+                *c = ((*c as f32) * n).clamp(0.0, 255.0).round() as u8;
             }
+            let a = px[3];
+            px[0] = px[0].min(a);
+            px[1] = px[1].min(a);
+            px[2] = px[2].min(a);
         }
     }
 
@@ -433,7 +444,7 @@ pub fn render_aquarelle_bleed_pass(pixmap: &mut Pixmap, params: AquarelleBleedPa
     {
         for i in 0..4 {
             let v = (o[i] as f32) * inv + (b[i] as f32) * t;
-            d[i] = v.clamp(0.0, 255.0) as u8;
+            d[i] = v.clamp(0.0, 255.0).round() as u8;
         }
     }
 }
@@ -466,7 +477,7 @@ fn box_blur_horizontal(src: &[u8], dst: &mut [u8], width: usize, height: usize, 
         for x in 0..width {
             let oi = row + x * 4;
             for c in 0..4 {
-                dst[oi + c] = (sum[c] / window).clamp(0.0, 255.0) as u8;
+                dst[oi + c] = (sum[c] / window).clamp(0.0, 255.0).round() as u8;
             }
             // Slide window: subtract leftmost, add new rightmost.
             let left_idx = x.saturating_sub(radius);
@@ -508,7 +519,7 @@ fn box_blur_vertical(src: &[u8], dst: &mut [u8], width: usize, height: usize, ra
         for y in 0..height {
             let oi = col + y * stride;
             for c in 0..4 {
-                dst[oi + c] = (sum[c] / window).clamp(0.0, 255.0) as u8;
+                dst[oi + c] = (sum[c] / window).clamp(0.0, 255.0).round() as u8;
             }
             let top_idx = y.saturating_sub(radius);
             let bot_idx = if y + radius + 1 < height {
