@@ -1,6 +1,6 @@
 [package]
 name = "aquarelle"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 authors = ["kako-jun"]
 description = "Watercolor-style soft-bleed orb rendering: four tunable elements (bleed, bloom, offset, halo) composed onto a tiny-skia Pixmap. Renderer-agnostic and wasm-friendly."
