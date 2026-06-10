@@ -89,10 +89,11 @@ uniform blur.
 
 It ships in two matched forms so any renderer can use it:
 
-- **GPU** — `AQUA_BLEED_WGSL` is a WGSL fragment that `orber` and `additive`
-  (both wgpu) concatenate into their shaders. The host shader must define
-  `TAU`, `hash21`, `clampf`, and `coverage_at` first (signatures are in the
-  fragment header).
+- **GPU** — `AQUA_BLEED_WGSL` is a WGSL fragment for `orber` and `additive`
+  (both wgpu) to concatenate into their shaders. (They still carry an in-tree
+  copy today; wiring them onto this shared fragment is a later phase.) The host
+  shader must define `TAU`, `hash21`, `clampf`, and `coverage_at` first
+  (signatures are in the fragment header).
 - **CPU** — `aqua_blurred_coverage_cpu` / `aqua_character_cpu` mirror the same
   math in Rust for `blueprinter` (no GPU) and as a parity oracle.
 

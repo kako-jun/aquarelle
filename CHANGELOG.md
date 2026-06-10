@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.3.0]
+## [0.3.0] — 2026-06-11
 
 Third release. Adds the **spiral bleed** (にじみ) — a second, per-primitive
 bleed algorithm distinct from the v0.2 whole-pixmap box-blur pass. This is
