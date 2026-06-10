@@ -78,6 +78,47 @@ A 3-pass box blur approximates a Gaussian; a faint seed-derived paper
 grain is multiplied onto the blurred layer; the original picture is
 then re-composited on top.
 
+## Spiral bleed — にじみ (v0.3)
+
+The v0.2 pass above is a whole-pixmap box blur. v0.3 adds a second,
+**per-primitive** bleed: the 48-tap golden-angle spiral (`AQUA_BLEED_WGSL`)
+developed and approved in [`orber`](https://github.com/kako-jun/orber) (#239).
+It spatially averages each primitive's coverage so a sharp shape spreads into
+a formless, organic cloud — closer to pigment spreading on wet paper than a
+uniform blur.
+
+It ships in two matched forms so any renderer can use it:
+
+- **GPU** — `AQUA_BLEED_WGSL` is a WGSL fragment that `orber` and `additive`
+  (both wgpu) concatenate into their shaders. The host shader must define
+  `TAU`, `hash21`, `clampf`, and `coverage_at` first (signatures are in the
+  fragment header).
+- **CPU** — `aqua_blurred_coverage_cpu` / `aqua_character_cpu` mirror the same
+  math in Rust for `blueprinter` (no GPU) and as a parity oracle.
+
+This engine carries **にじみ only** (the formless spread). **ぼやけ** (plain
+edge softness) is intentionally *not* here — it stays in each consumer.
+Because the spread dissolves shapes, readability is the consumer's job:
+composite the sharp original on top of the bleed (ink line + watercolor wash).
+
+```rust
+use aquarelle::{aqua_blurred_coverage_cpu, aqua_character_cpu, SpiralBleedParams};
+
+let p = SpiralBleedParams { bleed: 1.0, bloom: 0.0, halo: 0.5, offset: 0.3 };
+
+let blur_px = 12.0 * p.bleed;
+let (alpha, scale) = aqua_blurred_coverage_cpu(
+    // your silhouette: return (straight_alpha, rgb_scale) at a tap point (x, y)
+    |x, y| { let _ = (x, y); (0.4, 1.0) },
+    (64.0, 64.0), // sample pixel
+    blur_px,
+    0.0,          // per-primitive seed
+    (0.0, 0.0),   // offset bias (0 = symmetric)
+);
+let rgb = aqua_character_cpu([0.2, 0.5, 0.9], alpha, p.bloom, p.halo);
+let _ = (scale, rgb);
+```
+
 ## The four elements
 
 | Knob | Range | What it does |

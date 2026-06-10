@@ -574,6 +574,168 @@ fn mix_with_white(rgb: [u8; 3], amount: f32) -> [u8; 3] {
     ]
 }
 
+// ============================================================================
+// 新「にじみ」= 48 タップ黄金角螺旋（orber #239 / #250 Phase 1）
+// ----------------------------------------------------------------------------
+// 旧 `render_aquarelle_bleed_pass`（CPU 3-pass box blur・全画面）とは別系統の、
+// **per-primitive** な本物の空間ブラー。orber で kako-jun が承認したルックを共有
+// エンジン化したもの。GPU は `AQUA_BLEED_WGSL`（orber/additive が include）、CPU は
+// 下の `*_cpu` リファレンス（blueprinter / parity オラクル用）。
+//
+// **このエンジンは「にじみ」だけを担う**。「ぼやけ」（orb 縁の柔らかさ / falloff）は
+// 各アプリに残す。にじみは形を formless 化する空間ブラーであり、読みやすさは各アプリ
+// 側の「前面に元を重ねる」合成で担保する。box は温存（blueprinter が現役採用中）。
+// ============================================================================
+
+/// 共有「にじみ」WGSL フラグメント（48 タップ黄金角螺旋 + bloom/halo character）。
+///
+/// orber / additive（どちらも wgpu）がシェーダに **結合** して使う。結合前にホスト側で
+/// `TAU` / `hash21` / `clampf` / `coverage_at` を定義しておくこと（必要シンボルと署名は
+/// フラグメント冒頭のコメント参照）。中身は orber `orb.wgsl` から byte 等価に移植。
+///
+/// box blur 経路（[`render_aquarelle_bleed_pass`]）とは別物。
+pub const AQUA_BLEED_WGSL: &str = include_str!("aqua_bleed.wgsl");
+
+/// 新「にじみ」（螺旋ブラー）の 4 軸パラメータ。各 `0.0..=1.0`。
+///
+/// orber の製品 UI は 3 段ボタン（weak/mid/strong）でこれを駆動する。量の目安は
+/// `weak ≈ 0.33` / `mid ≈ 0.66` / `strong ≈ 1.0`（実マッピングは消費側が持つ）。
+///
+/// **注意**: box blur 用の [`AquarelleBleedParams`]（`radius`/`intensity`/`halo`）とは
+/// 別の型。こちらは per-primitive 螺旋ブラーの 4 軸で、orber の `aqua_bleed` /
+/// `aqua_bloom` / `aqua_halo` / `aqua_offset` に対応する。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SpiralBleedParams {
+    /// にじみ（空間ブラー）量。`0.0` = 素の形（にじみオフ）→ `1.0` = 強く formless 化。
+    pub bleed: f32,
+    /// 中心の柔らかい明るいコア（控えめに白へ）。`0.0` = 無し。`bleed > 0` が前提。
+    pub bloom: f32,
+    /// 外周の彩度ブースト（枠リングは作らない）。`0.0` = 無し。`bleed > 0` が前提。
+    pub halo: f32,
+    /// にじみの左右非対称（disk 原点を seed 方向へずらす）。`0.0` = 対称。`bleed > 0` が前提。
+    pub offset: f32,
+}
+
+impl Default for SpiralBleedParams {
+    /// 全軸 `0.0` = にじみ無し（素の形）。
+    fn default() -> Self {
+        Self {
+            bleed: 0.0,
+            bloom: 0.0,
+            halo: 0.0,
+            offset: 0.0,
+        }
+    }
+}
+
+// --- CPU リファレンス（WGSL と同一の式・定数。blueprinter / parity オラクル用）-------
+// GPU と bit-exact ではない（CPU/GPU の sin 実装差）が、式と定数は WGSL に一致させる。
+// 不変条件（`blur_px=0` で単一タップ恒等・定数被覆で恒等・character の各軸オフで恒等）は
+// sin に依存せず厳密に成り立つので、それをテストの土台にする。
+
+/// 螺旋ブラーのタップ数（WGSL `AQUA_BLUR_TAPS` と一致）。
+pub const AQUA_BLUR_TAPS: u32 = 48;
+/// 黄金角（rad、WGSL `AQUA_GOLDEN_ANGLE` と一致）。値は orber `orb.wgsl` と逐字一致させる
+/// （f32 の表現桁を超えるが WGSL/naga も同じ f32 に丸めるので値は一致＝parity）。
+#[allow(clippy::excessive_precision)]
+pub const AQUA_GOLDEN_ANGLE: f32 = 2.39996323;
+/// bloom が白へ寄せる上限比（WGSL `BLOOM_MAX`）。
+pub const BLOOM_MAX: f32 = 0.45;
+/// halo の彩度ゲイン係数（WGSL `HALO_SAT_GAIN`）。
+pub const HALO_SAT_GAIN: f32 = 0.6;
+/// offset の disk 原点バイアス比（WGSL `AQUA_OFFSET_BIAS`）。
+pub const AQUA_OFFSET_BIAS: f32 = 0.6;
+/// 2π（WGSL がホスト供給を前提とする `TAU` = `6.28318530718` と同一 f32）。
+pub const AQUA_TAU: f32 = std::f32::consts::TAU;
+
+/// WGSL `smoothstep(edge0, edge1, x)` と同式（`edge0 > edge1` の逆向きも許容）。
+#[inline]
+fn aqua_smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
+    let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// WGSL `hash21` の CPU port。**`fract` は `v - v.floor()`**（`f32::fract` は符号付きで
+/// WGSL `fract` と異なるため使わない）。GPU の per-pixel ディザと同じ値を返す。
+#[inline]
+pub fn aqua_hash21(x: f32, y: f32) -> f32 {
+    let h = x * 127.1 + y * 311.7;
+    // 43758.5453123 は WGSL hash21 と逐字一致（f32 表現桁超だが同一 f32 に丸まる）。
+    #[allow(clippy::excessive_precision)]
+    let v = h.sin() * 43758.5453123;
+    v - v.floor()
+}
+
+/// WGSL `aqua_seed_dir` の CPU port。seed から決定論的な単位方向ベクトルを返す。
+#[inline]
+pub fn aqua_seed_dir_cpu(seed: f32) -> (f32, f32) {
+    let a = aqua_hash21(seed * 12.9898, seed * 78.233 + 4.1) * AQUA_TAU;
+    (a.cos(), a.sin())
+}
+
+/// WGSL `blurred_coverage` の CPU リファレンス。
+///
+/// `coverage_at` は「タップ点 `(x, y)` でのシルエット被覆 `(straight_alpha, rgb_scale)`」
+/// を返すクロージャ（消費側固有の `coverage_at` を呼び出し側がここへ束ねる）。`sample_px`
+/// は評価画素、`blur_px` は disk 半径、`seed` は per-primitive seed、`bias_px` は offset 軸の
+/// disk 原点ずれ（`offset = 0` で `(0.0, 0.0)`）。
+///
+/// `blur_px = 0` かつ `bias_px = (0, 0)` のとき全タップが `sample_px` に潰れ、結果は
+/// `coverage_at(sample_px)` そのものになる（sin に依存しない厳密恒等）。
+pub fn aqua_blurred_coverage_cpu(
+    coverage_at: impl Fn(f32, f32) -> (f32, f32),
+    sample_px: (f32, f32),
+    blur_px: f32,
+    seed: f32,
+    bias_px: (f32, f32),
+) -> (f32, f32) {
+    let n = AQUA_BLUR_TAPS;
+    let nf = n as f32;
+    let ang0 = seed * AQUA_GOLDEN_ANGLE * 7.0 + aqua_hash21(sample_px.0, sample_px.1) * AQUA_TAU;
+    let cx = sample_px.0 + bias_px.0;
+    let cy = sample_px.1 + bias_px.1;
+    let mut sum_a = 0.0f32;
+    let mut sum_scaled = 0.0f32;
+    for k in 0..n {
+        let kf = k as f32;
+        let rr = blur_px * ((kf + 0.5) / nf).sqrt();
+        let th = ang0 + kf * AQUA_GOLDEN_ANGLE;
+        let sp_x = cx + th.cos() * rr;
+        let sp_y = cy + th.sin() * rr;
+        let (a, s) = coverage_at(sp_x, sp_y);
+        sum_a += a;
+        sum_scaled += a * s;
+    }
+    let avg_a = sum_a / nf;
+    let avg_scale = if sum_a > 0.0 { sum_scaled / sum_a } else { 1.0 };
+    (avg_a, avg_scale)
+}
+
+/// WGSL `aqua_character` の CPU リファレンス（ブラー後の色味補正。各軸 `0.0` で恒等）。
+///
+/// `color` は straight RGB（各 `0.0..=1.0`）、`cov_a` はブラー後の被覆 alpha。
+/// `halo` は外周の彩度ブースト、`bloom` は中心の白寄せ。`bloom = halo = 0.0` で `color`
+/// をそのまま返す（厳密恒等）。
+pub fn aqua_character_cpu(color: [f32; 3], cov_a: f32, bloom: f32, halo: f32) -> [f32; 3] {
+    let mut rgb = color;
+    if halo > 0.0 {
+        let edgeness = aqua_smoothstep(0.45, 0.05, cov_a);
+        let luma = rgb[0] * 0.299 + rgb[1] * 0.587 + rgb[2] * 0.114;
+        let sat_gain = 1.0 + halo * HALO_SAT_GAIN * edgeness;
+        for c in rgb.iter_mut() {
+            *c = (luma + (*c - luma) * sat_gain).clamp(0.0, 1.0);
+        }
+    }
+    if bloom > 0.0 {
+        let centerness = aqua_smoothstep(0.18, 0.5, cov_a);
+        let t = bloom * BLOOM_MAX * centerness;
+        for c in rgb.iter_mut() {
+            *c = *c * (1.0 - t) + t; // mix(rgb, white=1.0, t)
+        }
+    }
+    rgb
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1094,5 +1256,120 @@ mod tests {
             "center red should be lifted off zero by blurred white neighbors, got {}",
             center.red()
         );
+    }
+}
+
+#[cfg(test)]
+mod spiral_bleed_tests {
+    use super::*;
+
+    #[test]
+    fn wgsl_fragment_exposes_expected_symbols() {
+        assert!(AQUA_BLEED_WGSL.contains("fn blurred_coverage"));
+        assert!(AQUA_BLEED_WGSL.contains("fn aqua_character"));
+        assert!(AQUA_BLEED_WGSL.contains("fn aqua_seed_dir"));
+        assert!(AQUA_BLEED_WGSL.contains("AQUA_BLUR_TAPS"));
+    }
+
+    #[test]
+    fn cpu_consts_match_documented_values() {
+        assert_eq!(AQUA_BLUR_TAPS, 48);
+        assert_eq!(BLOOM_MAX, 0.45);
+        assert_eq!(HALO_SAT_GAIN, 0.6);
+        assert_eq!(AQUA_OFFSET_BIAS, 0.6);
+        // 黄金角 = π(3−√5)。リテラル比較（トートロジー）でなく独立計算で検証する。
+        let golden = std::f32::consts::PI * (3.0 - 5.0_f32.sqrt());
+        assert!(
+            (AQUA_GOLDEN_ANGLE - golden).abs() < 1e-5,
+            "golden angle {} vs {}",
+            AQUA_GOLDEN_ANGLE,
+            golden
+        );
+        assert_eq!(AQUA_TAU, std::f32::consts::TAU);
+    }
+
+    #[test]
+    fn blur_zero_is_single_tap_identity() {
+        // blur_px=0 & bias=0 → 全タップが sample_px に潰れる → sampler の値そのもの。
+        // 位置依存の sampler（定数でない）を使い、潰れていることを保証する。
+        let sampler = |x: f32, y: f32| ((x * 0.01 + y * 0.02).rem_euclid(1.0), 0.7);
+        let expected = sampler(10.0, 20.0);
+        let got = aqua_blurred_coverage_cpu(sampler, (10.0, 20.0), 0.0, 3.0, (0.0, 0.0));
+        assert!(
+            (got.0 - expected.0).abs() < 1e-6,
+            "alpha {} vs {}",
+            got.0,
+            expected.0
+        );
+        assert!(
+            (got.1 - expected.1).abs() < 1e-6,
+            "scale {} vs {}",
+            got.1,
+            expected.1
+        );
+    }
+
+    #[test]
+    fn constant_coverage_averages_to_constant() {
+        // どの位置でも (0.4, 0.6) を返す被覆 → 平均も (0.4, 0.6)。
+        let got = aqua_blurred_coverage_cpu(|_, _| (0.4, 0.6), (5.0, 5.0), 8.0, 1.0, (0.0, 0.0));
+        assert!((got.0 - 0.4).abs() < 1e-6, "alpha {}", got.0);
+        assert!((got.1 - 0.6).abs() < 1e-6, "scale {}", got.1);
+    }
+
+    #[test]
+    fn zero_alpha_coverage_keeps_unit_scale() {
+        // 被覆 alpha が全タップ 0 → avg_scale は 1.0 にフォールバック（0 除算回避）。
+        let got = aqua_blurred_coverage_cpu(|_, _| (0.0, 0.5), (5.0, 5.0), 8.0, 1.0, (0.0, 0.0));
+        assert_eq!(got.0, 0.0);
+        assert_eq!(got.1, 1.0);
+    }
+
+    #[test]
+    fn character_identity_when_axes_off() {
+        let c = [0.2, 0.6, 0.9];
+        assert_eq!(aqua_character_cpu(c, 0.3, 0.0, 0.0), c);
+    }
+
+    #[test]
+    fn halo_increases_saturation_at_edge() {
+        let c = [0.8, 0.2, 0.2];
+        let cov_a = 0.2; // 縁レンジ → edgeness > 0
+        let luma = c[0] * 0.299 + c[1] * 0.587 + c[2] * 0.114;
+        let sat = |v: [f32; 3]| (v[0] - luma).abs() + (v[1] - luma).abs() + (v[2] - luma).abs();
+        let base = aqua_character_cpu(c, cov_a, 0.0, 0.0);
+        let haloed = aqua_character_cpu(c, cov_a, 0.0, 1.0);
+        assert!(
+            sat(haloed) > sat(base),
+            "halo should boost saturation: {} vs {}",
+            sat(haloed),
+            sat(base)
+        );
+    }
+
+    #[test]
+    fn bloom_moves_toward_white_in_interior() {
+        let c = [0.2, 0.3, 0.4];
+        let cov_a = 0.5; // 内部 → centerness 高
+        let base = aqua_character_cpu(c, cov_a, 0.0, 0.0);
+        let bloomed = aqua_character_cpu(c, cov_a, 1.0, 0.0);
+        for i in 0..3 {
+            assert!(
+                bloomed[i] > base[i],
+                "bloom channel {} should rise toward white: {} vs {}",
+                i,
+                bloomed[i],
+                base[i]
+            );
+        }
+    }
+
+    #[test]
+    fn seed_dir_is_unit_vector() {
+        for &seed in &[0.0f32, 0.3, 1.0, 7.5, 42.0] {
+            let (dx, dy) = aqua_seed_dir_cpu(seed);
+            let len = (dx * dx + dy * dy).sqrt();
+            assert!((len - 1.0).abs() < 1e-5, "seed {} → len {}", seed, len);
+        }
     }
 }

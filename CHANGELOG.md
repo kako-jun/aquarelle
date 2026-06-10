@@ -1,5 +1,41 @@
 # Changelog
 
+## [0.3.0]
+
+Third release. Adds the **spiral bleed** (にじみ) — a second, per-primitive
+bleed algorithm distinct from the v0.2 whole-pixmap box-blur pass. This is
+the watercolor bleed developed and approved in `orber` (#239), now shared so
+`orber` and `additive` (both wgpu) can `include` the WGSL and `blueprinter`
+(CPU) can use the Rust reference. The shared engine carries **にじみ only**
+(the formless spreading bleed); **ぼやけ** (plain edge softness) stays in each
+consumer. Readability is the consumer's job (composite the sharp original on
+top of the bleed).
+
+### Added
+
+- `AQUA_BLEED_WGSL` — the shared WGSL fragment (48-tap golden-angle spiral
+  spatial blur + `bloom`/`halo` color character). Byte-equivalent to orber's
+  in-tree `orb.wgsl`. The consuming shader must define `TAU`, `hash21`,
+  `clampf`, and `coverage_at` before concatenation (signatures documented in
+  the fragment header).
+- `SpiralBleedParams { bleed, bloom, halo, offset }` — the 4-axis params for
+  the spiral bleed (each `0.0..=1.0`), mapping to orber's
+  `aqua_bleed`/`aqua_bloom`/`aqua_halo`/`aqua_offset`. Distinct from the
+  box-blur `AquarelleBleedParams`.
+- CPU reference (mirrors the WGSL math exactly, for `blueprinter` + as a
+  parity oracle): `aqua_blurred_coverage_cpu`, `aqua_character_cpu`,
+  `aqua_seed_dir_cpu`, `aqua_hash21`, plus the constants `AQUA_BLUR_TAPS`,
+  `AQUA_GOLDEN_ANGLE`, `BLOOM_MAX`, `HALO_SAT_GAIN`, `AQUA_OFFSET_BIAS`,
+  `AQUA_TAU`. (Not bit-exact with the GPU across the `sin` boundary; the
+  invariant tests — single-tap at `blur=0`, constant-coverage identity,
+  character axes-off identity — hold regardless.)
+
+### Unchanged
+
+- `render_aquarelle_orb` / `AquarelleParams` and the v0.2 box-blur pass
+  `render_aquarelle_bleed_pass` / `AquarelleBleedParams` are untouched
+  (`blueprinter` still depends on the box pass).
+
 ## [0.2.0] — 2026-05-18
 
 Second public release. Adds a whole-pixmap bleed pass alongside the
